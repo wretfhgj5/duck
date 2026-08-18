@@ -3504,61 +3504,168 @@ function sendSSE(
     );
 }
 
-async function streamCompletion(res, model, response, messages) {
-    const id = makeId('chatcmpl');
-    const created = Math.floor(Date.now() / 1000);
-    const usage = estimateUsage(messages, response);
+async function streamCompletion(
+    res,
+    model,
+    response,
+    messages
+) {
+
+    const id =
+        makeId(
+            'chatcmpl'
+        );
+
+    const created =
+        Math.floor(
+            Date.now() / 1000
+        );
+
+    const usage =
+        estimateUsage(
+            messages,
+            response
+        );
+
+    // Split response into smaller chunks for better client compatibility
+    const chunks =
+        response.match(
+            /[\s\S]{1,50}/g
+        ) || [
+            response
+        ];
 
     if (!res.headersSent) {
         res.status(200);
-        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-        res.setHeader('Cache-Control', 'no-cache, no-transform');
-        res.setHeader('Connection', 'keep-alive');
-        res.setHeader('X-Accel-Buffering', 'no');
+
+        res.setHeader(
+            'Content-Type',
+            'text/event-stream; charset=utf-8'
+        );
+
+        res.setHeader(
+            'Cache-Control',
+            'no-cache, no-transform'
+        );
+
+        res.setHeader(
+            'Connection',
+            'keep-alive'
+        );
+
+        res.setHeader(
+            'X-Accel-Buffering',
+            'no'
+        );
+
         res.flushHeaders?.();
     }
 
-    // 1) First chunk with role
-    sendSSE(res, {
-        id,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{
-            index: 0,
-            delta: { role: 'assistant' },
-            finish_reason: null
-        }]
-    });
+    sendSSE(
+        res,
+        {
+            id,
 
-    // 2) Single content chunk (whole response)
-    sendSSE(res, {
-        id,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{
-            index: 0,
-            delta: { content: response },
-            finish_reason: null
-        }]
-    });
+            object:
+                'chat.completion.chunk',
 
-    // 3) Final chunk with finish_reason and usage
-    sendSSE(res, {
-        id,
-        object: 'chat.completion.chunk',
-        created,
-        model,
-        choices: [{
-            index: 0,
-            delta: {},
-            finish_reason: 'stop'
-        }],
-        usage
-    });
+            created,
 
-    res.write('data: [DONE]\n\n');
+            model,
+
+            choices: [
+                {
+                    index: 0,
+
+                    delta: {
+                        role:
+                            'assistant'
+                    },
+
+                    finish_reason:
+                        null
+                }
+            ]
+        }
+    );
+
+    for (
+        const chunk of chunks
+    ) {
+
+        if (res.destroyed) {
+            return;
+        }
+
+        sendSSE(
+            res,
+            {
+                id,
+
+                object:
+                    'chat.completion.chunk',
+
+                created,
+
+                model,
+
+                choices: [
+                    {
+                        index: 0,
+
+                        delta: {
+                            content:
+                                chunk
+                        },
+
+                        finish_reason:
+                            null
+                    }
+                ]
+            }
+        );
+
+        if (
+            STREAM_DELAY > 0
+        ) {
+
+            await sleep(
+                STREAM_DELAY
+            );
+        }
+    }
+
+    sendSSE(
+        res,
+        {
+            id,
+
+            object:
+                'chat.completion.chunk',
+
+            created,
+
+            model,
+
+            choices: [
+                {
+                    index: 0,
+
+                    delta: {},
+
+                    finish_reason:
+                        'stop'
+                }
+            ],
+
+            usage
+        }
+    );
+
+    res.write(
+        'data: [DONE]\n\n'
+    );
+
     res.end();
 }
 
