@@ -629,35 +629,97 @@ function getLastUserMessage(
 // ============================================================
 // BUILD DUCK PROMPT
 // ============================================================
+function truncateText(text, maxLength) {
+    const str = String(text || '');
+    if (str.length <= maxLength) return str;
+    return str.slice(0, maxLength - 3) + '...';
+}
+
 function buildDuckPrompt(messages) {
     validateMessages(messages);
 
-    // جمع‌آوری system/developer messages (اختیاری)
+    const MAX_MESSAGE_CHARS = 1500;      // حداکثر طول هر پیام
+    const MAX_TOTAL_CHARS = 6000;        // حداکثر طول کل prompt
+    const LAST_USER_MAX_CHARS = 3000;    // آخرین پیام کاربر کمی بلندتر
+    const MAX_CONTEXT_MESSAGES = 4;      // فقط ۴ پیام آخر
+
+    // جدا کردن system messages
     const systemParts = [];
     for (const message of messages) {
         if (message.role === 'system' || message.role === 'developer') {
             const text = contentToText(message.content).trim();
-            if (text) systemParts.push(text);
+            if (text) systemParts.push(truncateText(text, MAX_MESSAGE_CHARS));
         }
     }
 
-    // آخرین پیام کاربر
-    const lastUser = getLastUserMessage(messages);
-    if (!lastUser) {
-        throw new Error('No user message found');
+    // فقط پیام‌های user و assistant را نگه می‌داریم
+    const conversation = messages
+        .filter(m => m.role === 'user' || m.role === 'assistant')
+        .slice(-MAX_CONTEXT_MESSAGES);
+
+    // اگر هیچ پیام کاربری نبود
+    if (conversation.length === 0 || !conversation.some(m => m.role === 'user')) {
+        const lastUser = getLastUserMessage(messages);
+        if (!lastUser) throw new Error('No user message found');
+        return truncateText(lastUser, LAST_USER_MAX_CHARS);
     }
 
-    // محدود کردن طول آخرین پیام کاربر (مثلاً 4000 کاراکتر)
-    const truncatedUser = lastUser.length > 4000 ? lastUser.slice(0, 3997) + '...' : lastUser;
+    // پیدا کردن آخرین پیام کاربر
+    const lastUserIndex = conversation.map(m => m.role).lastIndexOf('user');
+    const lastUserMsg = conversation[lastUserIndex];
 
-    // ساخت prompt نهایی: system (در صورت وجود) + آخرین پیام کاربر
     const blocks = [];
+
+    // system
     if (systemParts.length > 0) {
         blocks.push('System instructions:\n' + systemParts.join('\n\n'));
     }
-    blocks.push(truncatedUser);
 
-    return blocks.join('\n\n').trim();
+    // تاریخچه (همه به جز آخرین پیام کاربر)
+    if (lastUserIndex > 0) {
+        const history = conversation
+            .slice(0, lastUserIndex)
+            .map(item => {
+                const label = item.role === 'assistant' ? 'Assistant' : 'User';
+                return `${label}:\n${truncateText(contentToText(item.content), MAX_MESSAGE_CHARS)}`;
+            })
+            .join('\n\n');
+        blocks.push(history);
+    }
+
+    // آخرین پیام کاربر
+    blocks.push('Answer the latest user message directly.');
+    blocks.push(`Latest user message:\n${truncateText(contentToText(lastUserMsg.content), LAST_USER_MAX_CHARS)}`);
+
+    let finalPrompt = blocks.join('\n\n').trim();
+
+    // اگر مجموع از سقف بیشتر شد، قدیمی‌ترین بخش‌ها را حذف می‌کنیم
+    while (finalPrompt.length > MAX_TOTAL_CHARS && blocks.length > 1) {
+        // اگر system وجود دارد و می‌توان حذفش کرد
+        if (blocks[0].startsWith('System instructions:')) {
+            blocks.shift();
+        }
+        // در غیر این صورت، از تاریخچه قدیمی‌ترین پیام را حذف کن
+        else {
+            const historyIndex = blocks.findIndex(b => b.includes('\nUser:\n') || b.includes('\nAssistant:\n'));
+            if (historyIndex !== -1) {
+                const historyLines = blocks[historyIndex].split('\n\n');
+                if (historyLines.length > 1) {
+                    historyLines.shift(); // حذف قدیمی‌ترین پیام
+                    blocks[historyIndex] = historyLines.join('\n\n');
+                } else {
+                    blocks.splice(historyIndex, 1); // کل تاریخچه حذف شود
+                }
+            } else {
+                // اگر تاریخچه پیدا نشد، فقط آخرین پیام کاربر را نگه دار
+                const lastUser = getLastUserMessage(messages);
+                return truncateText(lastUser, LAST_USER_MAX_CHARS);
+            }
+        }
+        finalPrompt = blocks.join('\n\n').trim();
+    }
+
+    return finalPrompt;
 }
 // ============================================================
 // BROWSER
