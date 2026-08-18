@@ -92,7 +92,7 @@ const STREAM_DELAY = Number(
 );
 
 const KEEP_ALIVE_INTERVAL = Number(
-    process.env.KEEP_ALIVE_INTERVAL || 15000
+    process.env.KEEP_ALIVE_INTERVAL || 0
 );
 
 const DEBUG_ENABLED =
@@ -4258,16 +4258,17 @@ async function handleChatCompletions(
 
             res.flushHeaders?.();
 
-            const keepAliveTimer =
-                setInterval(() => {
-
+            // Optional keep-alive comments
+            let keepAliveTimer = null;
+            if (KEEP_ALIVE_INTERVAL > 0) {
+                keepAliveTimer = setInterval(() => {
                     if (!res.destroyed) {
                         res.write(
                             ': keep-alive\n\n'
                         );
                     }
-
                 }, KEEP_ALIVE_INTERVAL);
+            }
 
             try {
 
@@ -4279,9 +4280,11 @@ async function handleChatCompletions(
                         isClientClosed
                     );
 
-                clearInterval(
-                    keepAliveTimer
-                );
+                if (keepAliveTimer) {
+                    clearInterval(
+                        keepAliveTimer
+                    );
+                }
 
                 pool.completed();
 
@@ -4311,9 +4314,11 @@ async function handleChatCompletions(
 
             } catch (error) {
 
-                clearInterval(
-                    keepAliveTimer
-                );
+                if (keepAliveTimer) {
+                    clearInterval(
+                        keepAliveTimer
+                    );
+                }
 
                 pool.failed();
 
@@ -4667,6 +4672,22 @@ async function startServer() {
         `🔌 Port: ${PORT}`
     );
 
+    console.log(
+        `⏱️ Response timeout: ${RESPONSE_TIMEOUT}ms`
+    );
+
+    console.log(
+        `🔁 Retries: ${MAX_RETRIES}`
+    );
+
+    console.log(
+        `🔐 API key required: ${REQUIRE_API_KEY}`
+    );
+
+    console.log(
+        `💬 Keep-alive interval: ${KEEP_ALIVE_INTERVAL}ms (0=disabled)`
+    );
+
     try {
 
         await getBrowser();
@@ -4699,22 +4720,6 @@ async function startServer() {
 
                 console.log(
                     `📡 Responses: /v1/responses`
-                );
-
-                console.log(
-                    `⚡ Max concurrency: ${MAX_CONCURRENCY}`
-                );
-
-                console.log(
-                    `⏱️ Response timeout: ${RESPONSE_TIMEOUT}ms`
-                );
-
-                console.log(
-                    `🔁 Retries: ${MAX_RETRIES}`
-                );
-
-                console.log(
-                    `🔐 API key required: ${REQUIRE_API_KEY}`
                 );
 
                 console.log(
