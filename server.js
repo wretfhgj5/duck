@@ -10,6 +10,7 @@
  *   GET  /health
  *   GET  /v1/models
  *   POST /v1/chat/completions
+ *   POST /v1/responses
  *
  * Compatibility:
  *   GET  /models
@@ -64,7 +65,7 @@ const PAGE_TIMEOUT = Number(
 );
 
 const RESPONSE_TIMEOUT = Number(
-    process.env.RESPONSE_TIMEOUT || 120000
+    process.env.RESPONSE_TIMEOUT || 80000
 );
 
 const POLL_INTERVAL = Number(
@@ -76,7 +77,7 @@ const STABLE_POLLS = Number(
 );
 
 const MAX_RETRIES = Number(
-    process.env.MAX_RETRIES || 2
+    process.env.MAX_RETRIES || 1
 );
 
 const MAX_CONCURRENCY = Math.max(
@@ -88,6 +89,10 @@ const MAX_CONCURRENCY = Math.max(
 
 const STREAM_DELAY = Number(
     process.env.STREAM_DELAY || 8
+);
+
+const KEEP_ALIVE_INTERVAL = Number(
+    process.env.KEEP_ALIVE_INTERVAL || 15000
 );
 
 const DEBUG_ENABLED =
@@ -283,16 +288,20 @@ class ConcurrencyPool {
         ) {
             this.active++;
 
-            console.log(
-                `🟢 Pool slot acquired: ${this.active}/${this.size}`
-            );
+            if (DEBUG_ENABLED) {
+                console.log(
+                    `🟢 Pool slot acquired: ${this.active}/${this.size}`
+                );
+            }
 
             return;
         }
 
-        console.log(
-            `⏳ Pool full: active=${this.active}/${this.size}, waiting=${this.waiting.length + 1}`
-        );
+        if (DEBUG_ENABLED) {
+            console.log(
+                `⏳ Pool full: active=${this.active}/${this.size}, waiting=${this.waiting.length + 1}`
+            );
+        }
 
         await new Promise(
             resolve => {
@@ -312,9 +321,11 @@ class ConcurrencyPool {
             const next =
                 this.waiting.shift();
 
-            console.log(
-                `🔄 Pool slot passed to waiting request`
-            );
+            if (DEBUG_ENABLED) {
+                console.log(
+                    `🔄 Pool slot passed to waiting request`
+                );
+            }
 
             next();
             return;
@@ -326,9 +337,11 @@ class ConcurrencyPool {
                 this.active - 1
             );
 
-        console.log(
-            `🔵 Pool slot released: ${this.active}/${this.size}`
-        );
+        if (DEBUG_ENABLED) {
+            console.log(
+                `🔵 Pool slot released: ${this.active}/${this.size}`
+            );
+        }
     }
 
     completed() {
@@ -398,63 +411,51 @@ function makeId(prefix) {
 // ============================================================
 
 function resolveModel(requested) {
+    let raw = String(requested || '').trim();
 
-    const raw =
-        String(
-            requested || ''
-        ).trim();
+    // Accept "duck/gpt-5.4-nano" or any provider prefix
+    const afterLastSlash = raw.includes('/')
+        ? raw.split('/').pop().trim()
+        : raw;
 
-    if (
-        MODELS[raw]
-    ) {
-        return {
-            requested: raw,
-            actual: raw,
-            aliased: false
-        };
+    const candidates = [raw, afterLastSlash];
+
+    for (const candidate of candidates) {
+        if (MODELS[candidate]) {
+            return {
+                requested: raw,
+                actual: candidate,
+                aliased: candidate !== raw
+            };
+        }
+
+        if (COMPAT_ALIASES[candidate]) {
+            return {
+                requested: raw,
+                actual: COMPAT_ALIASES[candidate],
+                aliased: true
+            };
+        }
     }
 
-    if (
-        COMPAT_ALIASES[raw]
-    ) {
-        return {
-            requested: raw,
-            actual:
-                COMPAT_ALIASES[raw],
-            aliased: true
-        };
-    }
+    const lower = raw.toLowerCase();
+    const lowerAfterSlash = afterLastSlash.toLowerCase();
 
-    const lower =
-        raw.toLowerCase();
-
-    for (
-        const [id, definition]
-        of Object.entries(
-            MODELS
-        )
-    ) {
-
+    for (const [id, definition] of Object.entries(MODELS)) {
         const values = [
             id,
             ...(definition.labels || []),
             ...(definition.aliases || [])
         ];
 
-        if (
-            values.some(
-                value =>
-                    String(value)
-                        .toLowerCase() ===
-                    lower
-            )
-        ) {
+        if (values.some(value => {
+            const v = String(value).toLowerCase();
+            return v === lower || v === lowerAfterSlash;
+        })) {
             return {
                 requested: raw,
                 actual: id,
-                aliased:
-                    lower !==
-                    id.toLowerCase()
+                aliased: lowerAfterSlash !== id.toLowerCase()
             };
         }
     }
@@ -850,6 +851,7 @@ async function getBrowser() {
                         '--disable-background-networking',
                         '--disable-background-timer-throttling',
                         '--disable-renderer-backgrounding',
+                        '--disable-blink-features=AutomationControlled',
                         '--disable-features=Translate,BackForwardCache',
                         '--window-size=1920,1080'
                     ]
@@ -937,15 +939,32 @@ async function setupPage(page) {
                 );
 
             } catch (_) {}
+
+            try {
+
+                Object.defineProperty(
+                    navigator,
+                    'plugins',
+                    {
+                        configurable: true,
+                        get: () => [
+                            1, 2, 3, 4, 5
+                        ]
+                    }
+                );
+
+            } catch (_) {}
         }
     );
 
     page.on(
         'pageerror',
         error => {
-            console.log(
-                `🌐 PAGE ERROR: ${error.message}`
-            );
+            if (DEBUG_ENABLED) {
+                console.log(
+                    `🌐 PAGE ERROR: ${error.message}`
+                );
+            }
         }
     );
 
@@ -965,9 +984,11 @@ async function setupPage(page) {
                 )
             ) {
 
-                console.log(
-                    `🌐 REQUEST FAILED: ${request.url()} -> ${failure.errorText}`
-                );
+                if (DEBUG_ENABLED) {
+                    console.log(
+                        `🌐 REQUEST FAILED: ${request.url()} -> ${failure.errorText}`
+                    );
+                }
             }
         }
     );
@@ -1273,9 +1294,11 @@ async function clickOnboarding(
 
     if (clicked) {
 
-        console.log(
-            `🖱️ Onboarding clicked: ${clicked}`
-        );
+        if (DEBUG_ENABLED) {
+            console.log(
+                `🖱️ Onboarding clicked: ${clicked}`
+            );
+        }
 
         await sleep(
             1200
@@ -1291,9 +1314,11 @@ async function handleOnboarding(
     page
 ) {
 
-    console.log(
-        '🔍 Checking Duck.ai onboarding...'
-    );
+    if (DEBUG_ENABLED) {
+        console.log(
+            '🔍 Checking Duck.ai onboarding...'
+        );
+    }
 
     for (
         let i = 0;
@@ -1357,9 +1382,19 @@ async function navigateWithRetry(
                 }
             );
 
-            await sleep(
-                2500
-            );
+            // Wait for main textarea to appear
+            try {
+                await page.waitForSelector(
+                    'textarea',
+                    {
+                        timeout: 15000,
+                        visible: true
+                    }
+                );
+            } catch (_) {
+                // Fallback to sleep
+                await sleep(2500);
+            }
 
             const ready =
                 await handleOnboarding(
@@ -1804,11 +1839,13 @@ async function selectModel(
             page
         );
 
-    console.log(
-        `🤖 Current model: ${
-            current || 'unknown'
-        }`
-    );
+    if (DEBUG_ENABLED) {
+        console.log(
+            `🤖 Current model: ${
+                current || 'unknown'
+            }`
+        );
+    }
 
     if (
         await verifyModel(
@@ -1817,9 +1854,11 @@ async function selectModel(
         )
     ) {
 
-        console.log(
-            `✅ Model already selected: ${actualModel}`
-        );
+        if (DEBUG_ENABLED) {
+            console.log(
+                `✅ Model already selected: ${actualModel}`
+            );
+        }
 
         return true;
     }
@@ -1835,9 +1874,11 @@ async function selectModel(
         );
     }
 
-    console.log(
-        '🔽 Model picker opened'
-    );
+    if (DEBUG_ENABLED) {
+        console.log(
+            '🔽 Model picker opened'
+        );
+    }
 
     const clicked =
         await findAndClickModel(
@@ -1860,9 +1901,11 @@ async function selectModel(
         );
     }
 
-    console.log(
-        `🖱️ Model option clicked: ${clicked}`
-    );
+    if (DEBUG_ENABLED) {
+        console.log(
+            `🖱️ Model option clicked: ${clicked}`
+        );
+    }
 
     await sleep(900);
 
@@ -1879,11 +1922,13 @@ async function selectModel(
             )
         ) {
 
-            console.log(
-                `✅ VERIFIED Duck.ai model: ${await getCurrentModel(
-                    page
-                )}`
-            );
+            if (DEBUG_ENABLED) {
+                console.log(
+                    `✅ VERIFIED Duck.ai model: ${await getCurrentModel(
+                        page
+                    )}`
+                );
+            }
 
             return true;
         }
@@ -2065,30 +2110,7 @@ async function setTextareaText(
         page
     );
 
-    await textarea.type(
-        text,
-        {
-            delay: 3
-        }
-    );
-
-    await sleep(500);
-
-    let current =
-        await getTextareaValue(
-            page
-        );
-
-    if (
-        current === text
-    ) {
-        return;
-    }
-
-    console.log(
-        '⚠️ textarea.type() mismatch, using native setter'
-    );
-
+    // Use native setter first for speed
     await page.evaluate(
         value => {
 
@@ -2143,7 +2165,34 @@ async function setTextareaText(
         text
     );
 
-    await sleep(700);
+    await sleep(500);
+
+    let current =
+        await getTextareaValue(
+            page
+        );
+
+    if (
+        current === text
+    ) {
+        return;
+    }
+
+    if (DEBUG_ENABLED) {
+        console.log(
+            '⚠️ Native setter failed, falling back to type()'
+        );
+    }
+
+    // Fallback to typing
+    await textarea.type(
+        text,
+        {
+            delay: 10
+        }
+    );
+
+    await sleep(500);
 
     current =
         await getTextareaValue(
@@ -2283,9 +2332,11 @@ async function sendMessage(
         !ask.state.disabled
     ) {
 
-        console.log(
-            `📤 Clicking Ask: ${ask.selector}`
-        );
+        if (DEBUG_ENABLED) {
+            console.log(
+                `📤 Clicking Ask: ${ask.selector}`
+            );
+        }
 
         await ask.element.click();
 
@@ -2301,17 +2352,21 @@ async function sendMessage(
         if (
             current !== prompt
         ) {
-            console.log(
-                '✅ Message submitted with Ask'
-            );
+            if (DEBUG_ENABLED) {
+                console.log(
+                    '✅ Message submitted with Ask'
+                );
+            }
 
             return;
         }
     }
 
-    console.log(
-        '⚠️ Ask did not submit, trying Enter...'
-    );
+    if (DEBUG_ENABLED) {
+        console.log(
+            '⚠️ Ask did not submit, trying Enter...'
+        );
+    }
 
     const textarea =
         await getTextarea(
@@ -2337,9 +2392,11 @@ async function sendMessage(
         current !== prompt
     ) {
 
-        console.log(
-            '✅ Message submitted with Enter'
-        );
+        if (DEBUG_ENABLED) {
+            console.log(
+                '✅ Message submitted with Enter'
+            );
+        }
 
         return;
     }
@@ -2722,7 +2779,8 @@ async function waitForResponse(
     prompt,
     lastUser,
     actualModel,
-    oldCandidates
+    oldCandidates,
+    isClientClosed
 ) {
 
     const started =
@@ -2747,6 +2805,15 @@ async function waitForResponse(
         Date.now() - started <
         RESPONSE_TIMEOUT
     ) {
+
+        if (
+            isClientClosed &&
+            isClientClosed()
+        ) {
+            throw new Error(
+                'Client disconnected'
+            );
+        }
 
         await sleep(
             POLL_INTERVAL
@@ -2859,12 +2926,14 @@ async function waitForResponse(
             lastNormalized =
                 normalized;
 
-            console.log(
-                `🧩 Response update [${response.length} chars]: ${response.slice(
-                    0,
-                    220
-                )}`
-            );
+            if (DEBUG_ENABLED) {
+                console.log(
+                    `🧩 Response update [${response.length} chars]: ${response.slice(
+                        0,
+                        220
+                    )}`
+                );
+            }
         }
 
         const generating =
@@ -2914,7 +2983,8 @@ async function waitForResponse(
 async function executeDuckRequest(
     messages,
     actualModel,
-    requestId
+    requestId,
+    isClientClosed
 ) {
 
     let session = null;
@@ -2931,6 +3001,15 @@ async function executeDuckRequest(
             page,
             actualModel
         );
+
+        if (
+            isClientClosed &&
+            isClientClosed()
+        ) {
+            throw new Error(
+                'Client disconnected'
+            );
+        }
 
         if (
             !(await verifyModel(
@@ -2981,7 +3060,8 @@ async function executeDuckRequest(
                     messages
                 ),
                 actualModel,
-                oldCandidates
+                oldCandidates,
+                isClientClosed
             );
 
         const cleaned =
@@ -3013,7 +3093,8 @@ async function executeDuckRequest(
 async function chatWithDuckAI(
     messages,
     actualModel,
-    requestId
+    requestId,
+    isClientClosed
 ) {
 
     let lastError = null;
@@ -3023,6 +3104,15 @@ async function chatWithDuckAI(
         attempt <= MAX_RETRIES + 1;
         attempt++
     ) {
+
+        if (
+            isClientClosed &&
+            isClientClosed()
+        ) {
+            throw new Error(
+                'Client disconnected'
+            );
+        }
 
         try {
 
@@ -3034,7 +3124,8 @@ async function chatWithDuckAI(
             return await executeDuckRequest(
                 messages,
                 actualModel,
-                requestId
+                requestId,
+                isClientClosed
             );
 
         } catch (error) {
@@ -3240,27 +3331,31 @@ async function streamCompletion(
             response
         ];
 
-    res.status(200);
+    if (!res.headersSent) {
+        res.status(200);
 
-    res.setHeader(
-        'Content-Type',
-        'text/event-stream; charset=utf-8'
-    );
+        res.setHeader(
+            'Content-Type',
+            'text/event-stream; charset=utf-8'
+        );
 
-    res.setHeader(
-        'Cache-Control',
-        'no-cache, no-transform'
-    );
+        res.setHeader(
+            'Cache-Control',
+            'no-cache, no-transform'
+        );
 
-    res.setHeader(
-        'Connection',
-        'keep-alive'
-    );
+        res.setHeader(
+            'Connection',
+            'keep-alive'
+        );
 
-    res.setHeader(
-        'X-Accel-Buffering',
-        'no'
-    );
+        res.setHeader(
+            'X-Accel-Buffering',
+            'no'
+        );
+
+        res.flushHeaders?.();
+    }
 
     sendSSE(
         res,
@@ -3501,7 +3596,7 @@ app.get(
                 'Duck.ai OpenAI-Compatible Proxy',
 
             version:
-                'railway-1.0.0',
+                'railway-1.1.0',
 
             host:
                 HOST,
@@ -3518,6 +3613,9 @@ app.get(
 
                 chat:
                     '/v1/chat/completions',
+
+                responses:
+                    '/v1/responses',
 
                 health:
                     '/health'
@@ -3642,281 +3740,413 @@ app.get(
 );
 
 // ============================================================
-// CHAT COMPLETIONS
+// CHAT COMPLETIONS HANDLER
 // ============================================================
 
-app.post(
-    [
-        '/v1/chat/completions',
-        '/chat/completions',
-        '/api/chat'
-    ],
-    async (
-        req,
-        res
-    ) => {
+async function handleChatCompletions(
+    req,
+    res
+) {
 
-        const started =
-            Date.now();
+    const started =
+        Date.now();
 
-        const requestId =
-            makeId(
-                'req'
-            );
+    const requestId =
+        makeId(
+            'req'
+        );
+
+    let clientClosed = false;
+
+    res.on('close', () => {
+        clientClosed = true;
+    });
+
+    const isClientClosed = () => clientClosed;
+
+    /*
+     * AUTH
+     */
+
+    if (
+        !checkAuth(req)
+    ) {
+
+        return sendOpenAIError(
+            res,
+
+            401,
+
+            'Incorrect API key provided.',
+
+            'authentication_error',
+
+            'invalid_api_key'
+        );
+    }
+
+    /*
+     * Acquire concurrency slot.
+     */
+
+    await pool.acquire();
+
+    try {
+
+        const body =
+            req.body &&
+            typeof req.body ===
+                'object'
+                ? req.body
+                : {};
+
+        let messages =
+            body.messages;
 
         /*
-         * AUTH
+         * Legacy:
+         * /api/chat
          */
 
         if (
-            !checkAuth(req)
+            !Array.isArray(
+                messages
+            )
         ) {
 
-            return sendOpenAIError(
-                res,
-
-                401,
-
-                'Incorrect API key provided.',
-
-                'authentication_error',
-
-                'invalid_api_key'
-            );
-        }
-
-        /*
-         * Acquire concurrency slot.
-         */
-
-        await pool.acquire();
-
-        try {
-
-            const body =
-                req.body &&
-                typeof req.body ===
-                    'object'
-                    ? req.body
-                    : {};
-
-            let messages =
-                body.messages;
-
-            /*
-             * Legacy:
-             * /api/chat
-             */
-
             if (
-                !Array.isArray(
-                    messages
-                )
+                body.message
             ) {
 
-                if (
-                    body.message
-                ) {
+                messages = [
+                    {
+                        role:
+                            'user',
 
-                    messages = [
-                        {
-                            role:
-                                'user',
+                        content:
+                            String(
+                                body.message
+                            )
+                    }
+                ];
 
-                            content:
-                                String(
-                                    body.message
+            } else if (
+                body.input
+            ) {
+
+                messages = [
+                    {
+                        role:
+                            'user',
+
+                        content:
+                            typeof body.input ===
+                                'string'
+                                ? body.input
+                                : JSON.stringify(
+                                    body.input
                                 )
-                        }
-                    ];
+                    }
+                ];
 
-                } else {
-
-                    return sendOpenAIError(
-                        res,
-
-                        400,
-
-                        'messages must be a non-empty array.',
-
-                        'invalid_request_error',
-
-                        'invalid_messages',
-
-                        'messages'
-                    );
-                }
-            }
-
-            try {
-
-                validateMessages(
-                    messages
-                );
-
-            } catch (
-                error
-            ) {
-
-                return sendOpenAIError(
-                    res,
-
-                    error.status ||
-                        400,
-
-                    error.message,
-
-                    'invalid_request_error',
-
-                    error.code ||
-                        'invalid_request',
-
-                    'messages'
-                );
-            }
-
-            const requestedModel =
-                String(
-                    body.model ||
-                    DEFAULT_MODEL
-                ).trim();
-
-            let modelInfo;
-
-            try {
-
-                modelInfo =
-                    resolveModel(
-                        requestedModel
-                    );
-
-            } catch (
-                error
-            ) {
+            } else {
 
                 return sendOpenAIError(
                     res,
 
                     400,
 
-                    error.message,
+                    'messages must be a non-empty array.',
 
                     'invalid_request_error',
 
-                    'model_not_found',
+                    'invalid_messages',
 
-                    'model'
+                    'messages'
                 );
             }
+        }
 
-            const actualModel =
-                modelInfo.actual;
+        try {
 
-            const stream =
-                body.stream === true;
-
-            console.log('');
-            console.log(
-                '================================================'
-            );
-
-            console.log(
-                `📨 Request: ${requestId}`
-            );
-
-            console.log(
-                `Requested model: ${requestedModel}`
-            );
-
-            console.log(
-                `Actual model: ${actualModel}`
-            );
-
-            console.log(
-                `Messages: ${messages.length}`
-            );
-
-            console.log(
-                `Stream: ${stream}`
-            );
-
-            console.log(
-                `Pool: ${pool.active}/${pool.size} active, ${pool.waiting.length} waiting`
-            );
-
-            console.log(
-                `Latest user: ${getLastUserMessage(
-                    messages
-                ).slice(0, 200)}`
-            );
-
-            console.log(
-                '================================================'
-            );
-
-            const response =
-                await chatWithDuckAI(
-                    messages,
-                    actualModel,
-                    requestId
-                );
-
-            pool.completed();
-
-            const responseTime =
-                Date.now() -
-                started;
-
-            console.log(
-                `⚡ [${requestId}] Completed in ${responseTime}ms`
-            );
-
-            /*
-             * STREAM
-             */
-
-            if (stream) {
-
-                return await streamCompletion(
-                    res,
-                    actualModel,
-                    response,
-                    messages
-                );
-            }
-
-            /*
-             * NORMAL
-             */
-
-            return res.json(
-                createChatCompletion(
-                    actualModel,
-                    response,
-                    messages,
-                    requestId,
-                    responseTime
-                )
+            validateMessages(
+                messages
             );
 
         } catch (
             error
         ) {
 
-            pool.failed();
+            return sendOpenAIError(
+                res,
 
-            const status =
-                Number(
-                    error.status ||
-                    500
+                error.status ||
+                    400,
+
+                error.message,
+
+                'invalid_request_error',
+
+                error.code ||
+                    'invalid_request',
+
+                'messages'
+            );
+        }
+
+        const requestedModel =
+            String(
+                body.model ||
+                DEFAULT_MODEL
+            ).trim();
+
+        let modelInfo;
+
+        try {
+
+            modelInfo =
+                resolveModel(
+                    requestedModel
                 );
 
-            console.error(
-                `❌ [${requestId}] ${
-                    error.stack ||
-                    error.message
-                }`
+        } catch (
+            error
+        ) {
+
+            return sendOpenAIError(
+                res,
+
+                400,
+
+                error.message,
+
+                'invalid_request_error',
+
+                'model_not_found',
+
+                'model'
             );
+        }
+
+        const actualModel =
+            modelInfo.actual;
+
+        const stream =
+            body.stream === true;
+
+        console.log('');
+        console.log(
+            '================================================'
+        );
+
+        console.log(
+            `📨 Request: ${requestId}`
+        );
+
+        console.log(
+            `Requested model: ${requestedModel}`
+        );
+
+        console.log(
+            `Actual model: ${actualModel}`
+        );
+
+        console.log(
+            `Messages: ${messages.length}`
+        );
+
+        console.log(
+            `Stream: ${stream}`
+        );
+
+        console.log(
+            `Pool: ${pool.active}/${pool.size} active, ${pool.waiting.length} waiting`
+        );
+
+        console.log(
+            `Latest user: ${getLastUserMessage(
+                messages
+            ).slice(0, 200)}`
+        );
+
+        console.log(
+            '================================================'
+        );
+
+        /*
+         * STREAM - Send headers immediately
+         */
+
+        if (stream) {
+
+            res.status(200);
+
+            res.setHeader(
+                'Content-Type',
+                'text/event-stream; charset=utf-8'
+            );
+
+            res.setHeader(
+                'Cache-Control',
+                'no-cache, no-transform'
+            );
+
+            res.setHeader(
+                'Connection',
+                'keep-alive'
+            );
+
+            res.setHeader(
+                'X-Accel-Buffering',
+                'no'
+            );
+
+            res.flushHeaders?.();
+
+            const keepAliveTimer =
+                setInterval(() => {
+
+                    if (!res.destroyed) {
+                        res.write(
+                            ': keep-alive\n\n'
+                        );
+                    }
+
+                }, KEEP_ALIVE_INTERVAL);
+
+            try {
+
+                const response =
+                    await chatWithDuckAI(
+                        messages,
+                        actualModel,
+                        requestId,
+                        isClientClosed
+                    );
+
+                clearInterval(
+                    keepAliveTimer
+                );
+
+                pool.completed();
+
+                const responseTime =
+                    Date.now() -
+                    started;
+
+                console.log(
+                    `⚡ [${requestId}] Completed in ${responseTime}ms`
+                );
+
+                await streamCompletion(
+                    res,
+                    actualModel,
+                    response,
+                    messages
+                );
+
+            } catch (error) {
+
+                clearInterval(
+                    keepAliveTimer
+                );
+
+                pool.failed();
+
+                console.error(
+                    `❌ [${requestId}] ${
+                        error.stack ||
+                        error.message
+                    }`
+                );
+
+                if (!res.destroyed) {
+
+                    try {
+
+                        sendSSE(
+                            res,
+                            {
+                                error: {
+                                    message:
+                                        error.message ||
+                                        'Internal server error',
+
+                                    type:
+                                        'server_error',
+
+                                    code:
+                                        error.code ||
+                                        'proxy_error'
+                                }
+                            }
+                        );
+
+                        res.write(
+                            'data: [DONE]\n\n'
+                        );
+
+                        res.end();
+
+                    } catch (_) {}
+                }
+            }
+
+            return;
+        }
+
+        /*
+         * NON-STREAM
+         */
+
+        const response =
+            await chatWithDuckAI(
+                messages,
+                actualModel,
+                requestId,
+                isClientClosed
+            );
+
+        pool.completed();
+
+        const responseTime =
+            Date.now() -
+            started;
+
+        console.log(
+            `⚡ [${requestId}] Completed in ${responseTime}ms`
+        );
+
+        return res.json(
+            createChatCompletion(
+                actualModel,
+                response,
+                messages,
+                requestId,
+                responseTime
+            )
+        );
+
+    } catch (
+        error
+    ) {
+
+        pool.failed();
+
+        const status =
+            Number(
+                error.status ||
+                500
+            );
+
+        console.error(
+            `❌ [${requestId}] ${
+                error.stack ||
+                error.message
+            }`
+        );
+
+        if (!res.headersSent) {
 
             return sendOpenAIError(
                 res,
@@ -3933,16 +4163,40 @@ app.post(
                 error.code ||
                     'proxy_error'
             );
+        }
 
-        } finally {
+    } finally {
 
-            pool.release();
+        pool.release();
 
+        if (DEBUG_ENABLED) {
             console.log(
                 `📊 Pool: active=${pool.active}/${pool.size}, waiting=${pool.waiting.length}`
             );
         }
     }
+}
+
+// ============================================================
+// CHAT COMPLETIONS ROUTES
+// ============================================================
+
+app.post(
+    [
+        '/v1/chat/completions',
+        '/chat/completions',
+        '/api/chat'
+    ],
+    handleChatCompletions
+);
+
+// ============================================================
+// RESPONSES ROUTE (OpenAI Responses API)
+// ============================================================
+
+app.post(
+    '/v1/responses',
+    handleChatCompletions
 );
 
 // ============================================================
@@ -4063,6 +4317,8 @@ process.on(
             '💥 Uncaught exception:',
             error
         );
+
+        process.exit(1);
     }
 );
 
@@ -4144,6 +4400,10 @@ async function startServer() {
 
                 console.log(
                     `🤖 Chat: /v1/chat/completions`
+                );
+
+                console.log(
+                    `📡 Responses: /v1/responses`
                 );
 
                 console.log(
