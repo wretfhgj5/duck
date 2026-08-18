@@ -630,106 +630,59 @@ function getLastUserMessage(
 // BUILD DUCK PROMPT
 // ============================================================
 
-function buildDuckPrompt(
-    messages
-) {
+function buildDuckPrompt(messages) {
+    validateMessages(messages);
 
-    validateMessages(
-        messages
-    );
-
-    if (
-        messages.length === 1 &&
-        messages[0].role === 'user'
-    ) {
-        return contentToText(
-            messages[0].content
-        ).trim();
+    // اگر فقط یک پیام کاربر باشد، همان را برمی‌گردانیم
+    if (messages.length === 1 && messages[0].role === 'user') {
+        return contentToText(messages[0].content).trim();
     }
 
+    // جمع‌آوری system/developer messages
     const systemParts = [];
-    const conversation = [];
-
-    for (
-        const message of messages
-    ) {
-
-        const text =
-            contentToText(
-                message.content
-            ).trim();
-
-        if (!text) {
-            continue;
+    for (const message of messages) {
+        if (message.role === 'system' || message.role === 'developer') {
+            const text = contentToText(message.content).trim();
+            if (text) systemParts.push(text);
         }
-
-        if (
-            message.role === 'system' ||
-            message.role === 'developer'
-        ) {
-            systemParts.push(text);
-            continue;
-        }
-
-        conversation.push({
-            role: message.role,
-            content: text
-        });
     }
+
+    // فقط چند پیام آخر (به جز system) را نگه می‌داریم
+    const MAX_CONTEXT_MESSAGES = 6; // تعداد پیام‌های اخیر برای حفظ زمینه
+    const conversation = messages
+        .filter(m => m.role === 'user' || m.role === 'assistant')
+        .slice(-MAX_CONTEXT_MESSAGES);
 
     const blocks = [];
 
-    if (
-        systemParts.length > 0
-    ) {
-        blocks.push(
-            [
-                'System instructions:',
-                systemParts.join(
-                    '\n\n'
-                )
-            ].join('\n')
-        );
+    // بخش system
+    if (systemParts.length > 0) {
+        blocks.push('System instructions:\n' + systemParts.join('\n\n'));
     }
 
-    if (
-        conversation.length > 0
-    ) {
-        blocks.push(
-            conversation
-                .map(item => {
-
-                    const label =
-                        item.role === 'assistant'
-                            ? 'Assistant'
-                            : 'User';
-
-                    return (
-                        `${label}:\n` +
-                        item.content
-                    );
-                })
-                .join(
-                    '\n\n'
-                )
-        );
+    // تاریخچه (همه به جز آخرین پیام)
+    if (conversation.length > 1) {
+        const history = conversation
+            .slice(0, -1)
+            .map(item => {
+                const label = item.role === 'assistant' ? 'Assistant' : 'User';
+                return `${label}:\n${contentToText(item.content).trim()}`;
+            })
+            .join('\n\n');
+        blocks.push(history);
     }
 
-    blocks.push(
-        'Answer the latest user message directly.'
-    );
+    // آخرین پیام کاربر (که باید به آن پاسخ داده شود)
+    const lastUserMessage = getLastUserMessage(messages);
+    if (!lastUserMessage) {
+        throw new Error('No user message found');
+    }
 
-    blocks.push(
-        `Latest user message:\n${getLastUserMessage(
-            messages
-        )}`
-    );
+    blocks.push('Answer the latest user message directly.');
+    blocks.push(`Latest user message:\n${lastUserMessage}`);
 
-    return blocks
-        .join('\n\n')
-        .trim();
+    return blocks.join('\n\n').trim();
 }
-
 // ============================================================
 // BROWSER PATH
 // ============================================================
