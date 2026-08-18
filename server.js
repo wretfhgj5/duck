@@ -629,29 +629,53 @@ function getLastUserMessage(
 // ============================================================
 // BUILD DUCK PROMPT
 // ============================================================
-
 function buildDuckPrompt(messages) {
     validateMessages(messages);
 
-    // اگر فقط یک پیام کاربر باشد، همان را برمی‌گردانیم
+    // اگر فقط یک پیام کاربر باشد
     if (messages.length === 1 && messages[0].role === 'user') {
-        return contentToText(messages[0].content).trim();
+        return truncateText(contentToText(messages[0].content), 4000);
     }
+
+    const MAX_MESSAGE_CHARS = 2000;      // حداکثر طول هر پیام
+    const MAX_TOTAL_CHARS = 8000;        // حداکثر طول کل prompt
+    const LAST_USER_MAX_CHARS = 4000;    // آخرین پیام کاربر می‌تواند بلندتر باشد
 
     // جمع‌آوری system/developer messages
     const systemParts = [];
     for (const message of messages) {
         if (message.role === 'system' || message.role === 'developer') {
             const text = contentToText(message.content).trim();
-            if (text) systemParts.push(text);
+            if (text) systemParts.push(truncateText(text, MAX_MESSAGE_CHARS));
         }
     }
 
     // فقط چند پیام آخر (به جز system) را نگه می‌داریم
-    const MAX_CONTEXT_MESSAGES = 6; // تعداد پیام‌های اخیر برای حفظ زمینه
+    const MAX_CONTEXT_MESSAGES = 6;
     const conversation = messages
         .filter(m => m.role === 'user' || m.role === 'assistant')
         .slice(-MAX_CONTEXT_MESSAGES);
+
+    // آخرین پیام کاربر را پیدا می‌کنیم
+    const lastUserIndex = conversation.findIndex(
+        (m, idx) => idx === conversation.length - 1 && m.role === 'user'
+    );
+    // مطمئن می‌شویم آخرین پیام کاربر در انتهاست
+    const lastUserMessage = conversation[conversation.length - 1]?.role === 'user'
+        ? conversation[conversation.length - 1]
+        : null;
+
+    if (!lastUserMessage) {
+        // اگر آخرین پیام کاربر نبود، از کل آرایه اصلی پیدا کنیم
+        const allUserMessages = messages.filter(m => m.role === 'user');
+        if (allUserMessages.length === 0) {
+            throw new Error('No user message found');
+        }
+        // از تابع getLastUserMessage استفاده می‌کنیم
+        const lastUser = getLastUserMessage(messages);
+        if (!lastUser) throw new Error('No user message found');
+        return truncateText(lastUser, LAST_USER_MAX_CHARS);
+    }
 
     const blocks = [];
 
@@ -666,94 +690,43 @@ function buildDuckPrompt(messages) {
             .slice(0, -1)
             .map(item => {
                 const label = item.role === 'assistant' ? 'Assistant' : 'User';
-                return `${label}:\n${contentToText(item.content).trim()}`;
+                return `${label}:\n${truncateText(contentToText(item.content), MAX_MESSAGE_CHARS)}`;
             })
             .join('\n\n');
         blocks.push(history);
     }
 
-    // آخرین پیام کاربر (که باید به آن پاسخ داده شود)
-    const lastUserMessage = getLastUserMessage(messages);
-    if (!lastUserMessage) {
-        throw new Error('No user message found');
-    }
-
+    // آخرین پیام کاربر (با سقف بالاتر)
     blocks.push('Answer the latest user message directly.');
-    blocks.push(`Latest user message:\n${lastUserMessage}`);
+    blocks.push(`Latest user message:\n${truncateText(contentToText(lastUserMessage.content), LAST_USER_MAX_CHARS)}`);
 
-    return blocks.join('\n\n').trim();
-}
-// ============================================================
-// BROWSER PATH
-// ============================================================
+    let finalPrompt = blocks.join('\n\n').trim();
 
-function findBrowser() {
-
-    const linuxCandidates = [
-        CHROME_PATH,
-        '/usr/bin/chromium',
-        '/usr/bin/chromium-browser',
-        '/usr/bin/google-chrome',
-        '/usr/bin/google-chrome-stable'
-    ];
-
-    const windowsCandidates = [
-        process.env.CHROME_PATH,
-
-        'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-
-        'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-
-        path.join(
-            process.env.LOCALAPPDATA || '',
-            'Google\\Chrome\\Application\\chrome.exe'
-        ),
-
-        'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-
-        'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
-    ];
-
-    const candidates =
-        process.platform === 'win32'
-            ? [
-                ...windowsCandidates,
-                ...linuxCandidates
-            ]
-            : [
-                ...linuxCandidates,
-                ...windowsCandidates
-            ];
-
-    for (
-        const candidate of candidates
-    ) {
-
-        if (!candidate) {
-            continue;
-        }
-
-        try {
-
-            if (
-                fs.existsSync(
-                    candidate
-                )
-            ) {
-
-                console.log(
-                    `✅ Browser found: ${candidate}`
-                );
-
-                return candidate;
+    // اگر مجموع از MAX_TOTAL_CHARS بیشتر بود، از قدیمی‌ترین پیام‌ها کم می‌کنیم
+    while (finalPrompt.length > MAX_TOTAL_CHARS && blocks.length > 1) {
+        // حذف قدیمی‌ترین بلاک (system یا history)
+        if (blocks[0].startsWith('System instructions:')) {
+            blocks.shift(); // system را حذف می‌کنیم
+        } else if (blocks.length > 1) {
+            // بخش history را کوتاه‌تر می‌کنیم: از قدیمی‌ترین پیام حذف می‌کنیم
+            const historyBlock = blocks[1];
+            const historyLines = historyBlock.split('\n\n');
+            if (historyLines.length > 1) {
+                historyLines.shift(); // قدیمی‌ترین پیام را حذف کن
+                blocks[1] = historyLines.join('\n\n');
+            } else {
+                blocks.splice(1, 1); // کل history حذف شود
             }
-
-        } catch (_) {}
+        }
+        finalPrompt = blocks.join('\n\n').trim();
     }
 
-    throw new Error(
-        'Chromium/Chrome not found. Set CHROME_PATH.'
-    );
+    return finalPrompt;
+}
+
+function truncateText(text, maxLength) {
+    if (text.length <= maxLength) return text;
+    return text.slice(0, maxLength - 3) + '...';
 }
 
 // ============================================================
