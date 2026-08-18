@@ -629,106 +629,105 @@ function getLastUserMessage(
 // BUILD DUCK PROMPT
 // ============================================================
 
-function buildDuckPrompt(
-    messages
-) {
+function buildDuckPrompt(messages) {
+    validateMessages(messages);
 
-    validateMessages(
-        messages
-    );
-
-    if (
-        messages.length === 1 &&
-        messages[0].role === 'user'
-    ) {
-        return contentToText(
-            messages[0].content
-        ).trim();
+    // اگر فقط یک پیام کاربر باشد
+    if (messages.length === 1 && messages[0].role === 'user') {
+        return truncateText(contentToText(messages[0].content), 4000);
     }
 
+    const MAX_MESSAGE_CHARS = 2000;      // حداکثر طول هر پیام
+    const MAX_TOTAL_CHARS = 8000;        // حداکثر طول کل prompt
+    const LAST_USER_MAX_CHARS = 4000;    // آخرین پیام کاربر می‌تواند بلندتر باشد
+
+    // جمع‌آوری system/developer messages
     const systemParts = [];
-    const conversation = [];
-
-    for (
-        const message of messages
-    ) {
-
-        const text =
-            contentToText(
-                message.content
-            ).trim();
-
-        if (!text) {
-            continue;
+    for (const message of messages) {
+        if (message.role === 'system' || message.role === 'developer') {
+            const text = contentToText(message.content).trim();
+            if (text) systemParts.push(truncateText(text, MAX_MESSAGE_CHARS));
         }
+    }
 
-        if (
-            message.role === 'system' ||
-            message.role === 'developer'
-        ) {
-            systemParts.push(text);
-            continue;
+    // فقط چند پیام آخر (به جز system) را نگه می‌داریم
+    const MAX_CONTEXT_MESSAGES = 6;
+    const conversation = messages
+        .filter(m => m.role === 'user' || m.role === 'assistant')
+        .slice(-MAX_CONTEXT_MESSAGES);
+
+    // آخرین پیام کاربر را پیدا می‌کنیم
+    const lastUserIndex = conversation.findIndex(
+        (m, idx) => idx === conversation.length - 1 && m.role === 'user'
+    );
+    // مطمئن می‌شویم آخرین پیام کاربر در انتهاست
+    const lastUserMessage = conversation[conversation.length - 1]?.role === 'user'
+        ? conversation[conversation.length - 1]
+        : null;
+
+    if (!lastUserMessage) {
+        // اگر آخرین پیام کاربر نبود، از کل آرایه اصلی پیدا کنیم
+        const allUserMessages = messages.filter(m => m.role === 'user');
+        if (allUserMessages.length === 0) {
+            throw new Error('No user message found');
         }
-
-        conversation.push({
-            role: message.role,
-            content: text
-        });
+        // از تابع getLastUserMessage استفاده می‌کنیم
+        const lastUser = getLastUserMessage(messages);
+        if (!lastUser) throw new Error('No user message found');
+        return truncateText(lastUser, LAST_USER_MAX_CHARS);
     }
 
     const blocks = [];
 
-    if (
-        systemParts.length > 0
-    ) {
-        blocks.push(
-            [
-                'System instructions:',
-                systemParts.join(
-                    '\n\n'
-                )
-            ].join('\n')
-        );
+    // بخش system
+    if (systemParts.length > 0) {
+        blocks.push('System instructions:\n' + systemParts.join('\n\n'));
     }
 
-    if (
-        conversation.length > 0
-    ) {
-        blocks.push(
-            conversation
-                .map(item => {
-
-                    const label =
-                        item.role === 'assistant'
-                            ? 'Assistant'
-                            : 'User';
-
-                    return (
-                        `${label}:\n` +
-                        item.content
-                    );
-                })
-                .join(
-                    '\n\n'
-                )
-        );
+    // تاریخچه (همه به جز آخرین پیام)
+    if (conversation.length > 1) {
+        const history = conversation
+            .slice(0, -1)
+            .map(item => {
+                const label = item.role === 'assistant' ? 'Assistant' : 'User';
+                return `${label}:\n${truncateText(contentToText(item.content), MAX_MESSAGE_CHARS)}`;
+            })
+            .join('\n\n');
+        blocks.push(history);
     }
 
-    blocks.push(
-        'Answer the latest user message directly.'
-    );
+    // آخرین پیام کاربر (با سقف بالاتر)
+    blocks.push('Answer the latest user message directly.');
+    blocks.push(`Latest user message:\n${truncateText(contentToText(lastUserMessage.content), LAST_USER_MAX_CHARS)}`);
 
-    blocks.push(
-        `Latest user message:\n${getLastUserMessage(
-            messages
-        )}`
-    );
+    let finalPrompt = blocks.join('\n\n').trim();
 
-    return blocks
-        .join('\n\n')
-        .trim();
+    // اگر مجموع از MAX_TOTAL_CHARS بیشتر بود، از قدیمی‌ترین پیام‌ها کم می‌کنیم
+    while (finalPrompt.length > MAX_TOTAL_CHARS && blocks.length > 1) {
+        // حذف قدیمی‌ترین بلاک (system یا history)
+        if (blocks[0].startsWith('System instructions:')) {
+            blocks.shift(); // system را حذف می‌کنیم
+        } else if (blocks.length > 1) {
+            // بخش history را کوتاه‌تر می‌کنیم: از قدیمی‌ترین پیام حذف می‌کنیم
+            const historyBlock = blocks[1];
+            const historyLines = historyBlock.split('\n\n');
+            if (historyLines.length > 1) {
+                historyLines.shift(); // قدیمی‌ترین پیام را حذف کن
+                blocks[1] = historyLines.join('\n\n');
+            } else {
+                blocks.splice(1, 1); // کل history حذف شود
+            }
+        }
+        finalPrompt = blocks.join('\n\n').trim();
+    }
+
+    return finalPrompt;
 }
 
+function truncateText(text, maxLength) {
+    if (text.length <= maxLength) return text;
+    return text.slice(0, maxLength - 3) + '...';
+}
 // ============================================================
 // BROWSER PATH
 // ============================================================
