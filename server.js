@@ -3220,7 +3220,7 @@ function estimateUsage(
 }
 
 // ============================================================
-// OPENAI RESPONSE
+// OPENAI RESPONSE (Chat Completions)
 // ============================================================
 
 function createChatCompletion(
@@ -3286,7 +3286,210 @@ function createChatCompletion(
 }
 
 // ============================================================
-// SSE
+// OPENAI RESPONSES API
+// ============================================================
+
+function createResponsesCompletion(
+    model,
+    response,
+    messages,
+    requestId,
+    responseTime
+) {
+    const usage = estimateUsage(messages, response);
+    
+    return {
+        id: makeId('resp'),
+        object: 'response',
+        created_at: Math.floor(Date.now() / 1000),
+        status: 'completed',
+        model,
+        output: [
+            {
+                type: 'message',
+                id: makeId('msg'),
+                status: 'completed',
+                role: 'assistant',
+                content: [
+                    {
+                        type: 'output_text',
+                        text: response,
+                        annotations: []
+                    }
+                ]
+            }
+        ],
+        usage: {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            input_tokens_details: {
+                cached_tokens: 0
+            },
+            output_tokens_details: {
+                reasoning_tokens: 0
+            }
+        },
+        metadata: {
+            request_id: requestId,
+            actual_model: model,
+            response_time_ms: responseTime
+        }
+    };
+}
+
+async function streamResponsesCompletion(
+    res,
+    model,
+    response,
+    messages
+) {
+    const chunks = response.match(/[\s\S]{1,90}/g) || [response];
+    
+    if (!res.headersSent) {
+        res.status(200);
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache, no-transform');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.flushHeaders?.();
+    }
+    
+    const seq = () => Math.floor(Date.now() / 1000);
+    
+    // Initial response object
+    const initialResponse = createResponsesCompletion(
+        model,
+        response,
+        messages,
+        'stream',
+        0
+    );
+    
+    // response.created
+    res.write(`event: response.created\ndata: ${JSON.stringify({
+        type: 'response.created',
+        sequence_number: seq(),
+        response: {
+            ...initialResponse,
+            status: 'in_progress',
+            output: []
+        }
+    })}\n\n`);
+    
+    // response.in_progress
+    res.write(`event: response.in_progress\ndata: ${JSON.stringify({
+        type: 'response.in_progress',
+        sequence_number: seq(),
+        response: {
+            ...initialResponse,
+            status: 'in_progress',
+            output: []
+        }
+    })}\n\n`);
+    
+    // output_item.added
+    const messageId = makeId('msg');
+    res.write(`event: response.output_item.added\ndata: ${JSON.stringify({
+        type: 'response.output_item.added',
+        sequence_number: seq(),
+        output_index: 0,
+        item: {
+            id: messageId,
+            type: 'message',
+            status: 'in_progress',
+            role: 'assistant',
+            content: []
+        }
+    })}\n\n`);
+    
+    // content_part.added
+    res.write(`event: response.content_part.added\ndata: ${JSON.stringify({
+        type: 'response.content_part.added',
+        sequence_number: seq(),
+        item_id: messageId,
+        output_index: 0,
+        content_index: 0,
+        part: {
+            type: 'output_text',
+            text: '',
+            annotations: []
+        }
+    })}\n\n`);
+    
+    // Send text deltas
+    for (const chunk of chunks) {
+        if (res.destroyed) return;
+        
+        res.write(`event: response.output_text.delta\ndata: ${JSON.stringify({
+            type: 'response.output_text.delta',
+            sequence_number: seq(),
+            item_id: messageId,
+            output_index: 0,
+            content_index: 0,
+            delta: chunk
+        })}\n\n`);
+        
+        if (STREAM_DELAY > 0) {
+            await sleep(STREAM_DELAY);
+        }
+    }
+    
+    // content_part.done
+    res.write(`event: response.content_part.done\ndata: ${JSON.stringify({
+        type: 'response.content_part.done',
+        sequence_number: seq(),
+        item_id: messageId,
+        output_index: 0,
+        content_index: 0,
+        part: {
+            type: 'output_text',
+            text: response,
+            annotations: []
+        }
+    })}\n\n`);
+    
+    // output_item.done
+    res.write(`event: response.output_item.done\ndata: ${JSON.stringify({
+        type: 'response.output_item.done',
+        sequence_number: seq(),
+        output_index: 0,
+        item: {
+            id: messageId,
+            type: 'message',
+            status: 'completed',
+            role: 'assistant',
+            content: [
+                {
+                    type: 'output_text',
+                    text: response,
+                    annotations: []
+                }
+            ]
+        }
+    })}\n\n`);
+    
+    // response.completed
+    const finalResponse = createResponsesCompletion(
+        model,
+        response,
+        messages,
+        'stream',
+        0
+    );
+    
+    res.write(`event: response.completed\ndata: ${JSON.stringify({
+        type: 'response.completed',
+        sequence_number: seq(),
+        response: finalResponse
+    })}\n\n`);
+    
+    res.write('data: [DONE]\n\n');
+    res.end();
+}
+
+// ============================================================
+// SSE (Chat Completions)
 // ============================================================
 
 function sendSSE(
@@ -3596,7 +3799,7 @@ app.get(
                 'Duck.ai OpenAI-Compatible Proxy',
 
             version:
-                'railway-1.1.0',
+                'railway-1.2.0',
 
             host:
                 HOST,
@@ -3740,6 +3943,52 @@ app.get(
 );
 
 // ============================================================
+// HANDLE RESPONSES API
+// ============================================================
+
+async function handleResponsesCompletions(req, res) {
+    // Convert Responses API format to Chat Completions format
+    if (req.body && !req.body.messages && req.body.input) {
+        const input = req.body.input;
+        
+        if (typeof input === 'string') {
+            req.body.messages = [
+                { role: 'user', content: input }
+            ];
+        } else if (Array.isArray(input)) {
+            req.body.messages = input.map(item => {
+                if (typeof item === 'string') {
+                    return { role: 'user', content: item };
+                }
+                if (item && item.role && item.content) {
+                    return item;
+                }
+                if (item && item.type === 'message' && item.content) {
+                    const textContent = Array.isArray(item.content)
+                        ? item.content.map(c => c.text || '').join('\n')
+                        : item.content;
+                    return {
+                        role: item.role || 'user',
+                        content: textContent
+                    };
+                }
+                return { role: 'user', content: JSON.stringify(item) };
+            });
+        }
+    }
+    
+    // Add instructions as system message if not present
+    if (req.body && req.body.instructions && !req.body.messages?.some(m => m.role === 'system')) {
+        req.body.messages = [
+            { role: 'system', content: req.body.instructions },
+            ...(req.body.messages || [])
+        ];
+    }
+    
+    return handleChatCompletions(req, res);
+}
+
+// ============================================================
 // CHAT COMPLETIONS HANDLER
 // ============================================================
 
@@ -3763,6 +4012,8 @@ async function handleChatCompletions(
     });
 
     const isClientClosed = () => clientClosed;
+
+    const isResponsesAPI = req.path === '/v1/responses';
 
     /*
      * AUTH
@@ -3944,6 +4195,10 @@ async function handleChatCompletions(
         );
 
         console.log(
+            `API Type: ${isResponsesAPI ? 'Responses' : 'Chat Completions'}`
+        );
+
+        console.log(
             `Requested model: ${requestedModel}`
         );
 
@@ -4035,15 +4290,24 @@ async function handleChatCompletions(
                     started;
 
                 console.log(
-                    `⚡ [${requestId}] Completed in ${responseTime}ms`
+                    `⚡ [${requestId}] Completed in ${responseTime}ms, Response length: ${response.length}`
                 );
 
-                await streamCompletion(
-                    res,
-                    actualModel,
-                    response,
-                    messages
-                );
+                if (isResponsesAPI) {
+                    await streamResponsesCompletion(
+                        res,
+                        actualModel,
+                        response,
+                        messages
+                    );
+                } else {
+                    await streamCompletion(
+                        res,
+                        actualModel,
+                        response,
+                        messages
+                    );
+                }
 
             } catch (error) {
 
@@ -4064,29 +4328,52 @@ async function handleChatCompletions(
 
                     try {
 
-                        sendSSE(
-                            res,
-                            {
-                                error: {
-                                    message:
-                                        error.message ||
-                                        'Internal server error',
-
-                                    type:
-                                        'server_error',
-
-                                    code:
-                                        error.code ||
-                                        'proxy_error'
+                        if (isResponsesAPI) {
+                            // Send error in Responses API format
+                            res.write(`event: response.failed\ndata: ${JSON.stringify({
+                                type: 'response.failed',
+                                sequence_number: Math.floor(Date.now() / 1000),
+                                response: {
+                                    id: makeId('resp'),
+                                    object: 'response',
+                                    created_at: Math.floor(Date.now() / 1000),
+                                    status: 'failed',
+                                    model: actualModel,
+                                    output: [],
+                                    error: {
+                                        code: error.code || 'proxy_error',
+                                        message: error.message || 'Internal server error'
+                                    }
                                 }
-                            }
-                        );
+                            })}\n\n`);
+                            
+                            res.write('data: [DONE]\n\n');
+                            res.end();
+                        } else {
+                            sendSSE(
+                                res,
+                                {
+                                    error: {
+                                        message:
+                                            error.message ||
+                                            'Internal server error',
 
-                        res.write(
-                            'data: [DONE]\n\n'
-                        );
+                                        type:
+                                            'server_error',
 
-                        res.end();
+                                        code:
+                                            error.code ||
+                                            'proxy_error'
+                                    }
+                                }
+                            );
+
+                            res.write(
+                                'data: [DONE]\n\n'
+                            );
+
+                            res.end();
+                        }
 
                     } catch (_) {}
                 }
@@ -4114,8 +4401,20 @@ async function handleChatCompletions(
             started;
 
         console.log(
-            `⚡ [${requestId}] Completed in ${responseTime}ms`
+            `⚡ [${requestId}] Completed in ${responseTime}ms, Response length: ${response.length}`
         );
+
+        if (isResponsesAPI) {
+            return res.json(
+                createResponsesCompletion(
+                    actualModel,
+                    response,
+                    messages,
+                    requestId,
+                    responseTime
+                )
+            );
+        }
 
         return res.json(
             createChatCompletion(
@@ -4178,7 +4477,7 @@ async function handleChatCompletions(
 }
 
 // ============================================================
-// CHAT COMPLETIONS ROUTES
+// ROUTES
 // ============================================================
 
 app.post(
@@ -4190,13 +4489,9 @@ app.post(
     handleChatCompletions
 );
 
-// ============================================================
-// RESPONSES ROUTE (OpenAI Responses API)
-// ============================================================
-
 app.post(
     '/v1/responses',
-    handleChatCompletions
+    handleResponsesCompletions
 );
 
 // ============================================================
